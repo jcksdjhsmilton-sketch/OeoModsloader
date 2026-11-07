@@ -1,0 +1,599 @@
+name: LemonMod Loader - build otimizado (Android / WorldBox)
+
+# Gera: (1) melon_data.zip otimizado  (2) APK do instalador apontando para ESTE repositorio  (3) uma release.
+# O repositorio precisa ser PUBLICO (o instalador consulta a API de releases sem login).
+# Rode em: Actions > "LemonMod Loader - build otimizado" > Run workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_tag:
+        description: "Release estavel do LemonLoader usada como base (DLLs e runtime .NET)"
+        default: "0.6.5.1"
+      r2r_mode:
+        description: "Pre-compilacao ReadyToRun. Se o jogo crashar, rode de novo com no-corelib, melon-only ou off"
+        type: choice
+        default: all
+        options: [all, no-corelib, melon-only, "off"]
+      publish_release:
+        description: "Publicar release (o instalador baixa daqui)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  RUST_VERSION: "1.85.0"
+  CROSSGEN_VERSION: "8.0.6"
+  BASE_TAG: ${{ inputs.base_tag || '0.6.5.1' }}
+  R2R_MODE: ${{ inputs.r2r_mode || 'all' }}
+  WORK: ${{ github.workspace }}/work
+
+jobs:
+  core:
+    name: melon_data.zip otimizado
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Clonar LemonLoader (codigo atual)
+        run: |
+          set -euo pipefail
+          mkdir -p "$WORK"
+          git clone --depth 1 https://github.com/LemonLoader/MelonLoader.git "$WORK/src"
+
+      - name: Gravar ferramentas auxiliares
+        run: |
+          set -euo pipefail
+          KIT="$WORK/kit"; mkdir -p "$KIT"
+          mkdir -p "$(dirname "$KIT/patch_rust.py")"
+          cat > "$KIT/patch_rust.py" <<'__LEMON_EOF__'
+          #!/usr/bin/env python3
+          """LemonMod: performance patches for LemonLoader's Rust bootstrap (applied on top of upstream HEAD)."""
+          import sys, os
+
+          root = sys.argv[1]  # path to the cloned LemonLoader/MelonLoader repo
+
+          def sub(rel, old, new):
+              path = os.path.join(root, rel)
+              s = open(path, encoding="utf-8").read()
+              if old not in s:
+                  sys.exit(f"PATCH FAILED: pattern not found in {rel}:\n{old[:120]}")
+              open(path, "w", encoding="utf-8").write(s.replace(old, new, 1))
+              print(f"  patched {rel}")
+
+          # 1) Release profile: the upstream workspace had none (no LTO, 16 codegen units, symbols kept).
+          with open(os.path.join(root, "Cargo.toml"), "a", encoding="utf-8") as f:
+              f.write('''
+
+          [profile.release]
+          opt-level = 3
+          lto = "fat"
+          codegen-units = 1
+          strip = true
+          debug = false
+          incremental = false
+          ''')
+          print("  patched Cargo.toml")
+
+          # 2) debug_enabled!() collected std::env::args() into a Vec<String> on every call.
+          sub("Rust/Bootstrap/src/melonenv/macros.rs",
+          '''        if cfg!(debug_assertions) {
+                      true
+                  } else {
+                      let args: Vec<String> = std::env::args().collect();
+                      args.contains(&"--melonloader.debug".to_string())
+                  }''',
+          '''        $crate::logging::logger::debug_enabled()''')
+
+          # 3) logger: cached debug flag, log file kept open, debug! no longer formats when disabled.
+          L = "Rust/Bootstrap/src/logging/logger.rs"
+          sub(L, "use std::{io::Write, ffi::{CString, c_char}, sync::Arc};",
+                 "use std::{io::Write, ffi::{CString, c_char}, fs::File, sync::{Arc, Mutex, OnceLock}};")
+
+          sub(L, '''fn write(msg: &str) -> Result<(), DynErr> {
+              let log_file = log_path!();
+
+              let mut file = std::fs::OpenOptions::new()
+                  .write(true)
+                  .append(true)
+                  .create(true)
+                  .open(&log_file)
+                  .map_err(|_| LogError::FailedToWriteToLog)?;
+
+              let message = format!("{}\\r\\n", msg);
+
+              file.write_all(message.as_bytes())
+                  .map_err(|_| LogError::FailedToWriteToLog)?;
+
+              Ok(())
+          }''', '''/// [LemonMod] Cached once: scanning the process args on every debug! call was a hot path.
+          pub fn debug_enabled() -> bool {
+              if cfg!(debug_assertions) {
+                  return true;
+              }
+              static ENABLED: OnceLock<bool> = OnceLock::new();
+              *ENABLED.get_or_init(|| std::env::args().any(|a| a == "--melonloader.debug"))
+          }
+
+          /// [LemonMod] The log file is opened once and kept open (it used to be re-opened for every single line).
+          static LOG_HANDLE: Mutex<Option<File>> = Mutex::new(None);
+
+          fn write(msg: &str) -> Result<(), DynErr> {
+              let mut guard = LOG_HANDLE.lock().map_err(|_| LogError::FailedToWriteToLog)?;
+
+              if guard.is_none() {
+                  let file = std::fs::OpenOptions::new()
+                      .write(true)
+                      .append(true)
+                      .create(true)
+                      .open(log_path!())
+                      .map_err(|_| LogError::FailedToWriteToLog)?;
+                  *guard = Some(file);
+              }
+
+              let mut message = String::with_capacity(msg.len() + 2);
+              message.push_str(msg);
+              message.push_str("\\r\\n");
+
+              guard
+                  .as_mut()
+                  .unwrap()
+                  .write_all(message.as_bytes())
+                  .map_err(|_| LogError::FailedToWriteToLog)?;
+
+              Ok(())
+          }''')
+
+          sub(L, '''    let log_file = log_path!();
+
+              if log_file.exists() {''', '''    let log_file = log_path!();
+
+              if let Ok(mut guard) = LOG_HANDLE.lock() {
+                  *guard = None;
+              }
+
+              if log_file.exists() {''')
+
+          sub(L, '''    //case 3: multiple arguments
+              ($($arg:tt)*) => {{
+                  $crate::logging::logger::log_console_file($crate::logging::logger::LogLevel::Debug, &format_args!($($arg)*).to_string())
+              }};
+          }''', '''    //case 3: multiple arguments
+              // [LemonMod] returns early (without formatting anything) when debug is off
+              ($($arg:tt)*) => {{
+                  if !$crate::logging::logger::debug_enabled() {
+                      Ok::<(), $crate::errors::logerr::LogError>(())
+                  } else {
+                      $crate::logging::logger::log_console_file($crate::logging::logger::LogLevel::Debug, &format_args!($($arg)*).to_string())
+                  }
+              }};
+          }''')
+
+          # 4) GC thread-check callback: runs on every GC thread-suspend check.
+          sub("Rust/Bootstrap/src/base_assembly/dotnet.rs", '''fn mono_check_thread(tid: u64) -> bool {
+              debug!("[Dotnet] Checking thread {:#x}", tid).unwrap();
+
+              let runtime = crate::runtime!().unwrap();
+
+              
+              let mut size: usize = 0;
+              let get_all_attached_threads = unsafe { std::mem::transmute::<*mut c_void, fn(size: *mut size_t) -> *const *const Il2CppThread>(runtime.get_export_ptr("il2cpp_thread_get_all_attached_threads").unwrap()) };
+              let threads = get_all_attached_threads(addr_of_mut!(size));
+              let threads_slice = unsafe { std::slice::from_raw_parts(threads, size) };
+
+              for i in 0..size {
+                  let thread_id = unsafe { *(*threads_slice[i]).internal_thread }.tid;
+                  debug!("[Dotnet] Attached IL2CPP thread {:#x}", thread_id).unwrap();
+                  if thread_id == tid {
+                      return false;
+                  }
+              }
+
+              true''', '''/// [LemonMod] This runs on every GC thread-suspend check, so it must stay cheap:
+          /// the exported symbol is resolved once (it used to be a dlsym on every call) and
+          /// nothing is logged/formatted unless --melonloader.debug is set.
+          static GET_ALL_ATTACHED_THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+          fn mono_check_thread(tid: u64) -> bool {
+              let fn_addr = *GET_ALL_ATTACHED_THREADS.get_or_init(|| {
+                  crate::runtime!()
+                      .ok()
+                      .and_then(|r| r.get_export_ptr("il2cpp_thread_get_all_attached_threads").ok())
+                      .map(|p| p as usize)
+                      .unwrap_or(0)
+              });
+
+              if fn_addr == 0 {
+                  return true;
+              }
+
+              let get_all_attached_threads = unsafe { std::mem::transmute::<usize, fn(size: *mut size_t) -> *const *const Il2CppThread>(fn_addr) };
+
+              let mut size: usize = 0;
+              let threads = get_all_attached_threads(addr_of_mut!(size));
+              if threads.is_null() || size == 0 {
+                  return true;
+              }
+              let threads_slice = unsafe { std::slice::from_raw_parts(threads, size) };
+
+              for t in threads_slice {
+                  let thread_id = unsafe { *(**t).internal_thread }.tid;
+                  if thread_id == tid {
+                      return false;
+                  }
+              }
+
+              true''')
+
+          # 5) First-launch asset extraction copied the whole runtime (~125 MB) in 1 KB chunks.
+          sub("Rust/Bootstrap/src/utils/apk_asset_manager.rs", '''    const BUFFER_SIZE: usize = 1024;
+              let mut buffer = [0u8; BUFFER_SIZE];''', '''    // [LemonMod] 1 KB -> 256 KB: ~250x fewer read/write syscalls while copying the runtime out of the APK
+              const BUFFER_SIZE: usize = 256 * 1024;
+              let mut buffer = vec![0u8; BUFFER_SIZE];''')
+
+          print("Rust patches applied OK")
+          __LEMON_EOF__
+          mkdir -p "$(dirname "$KIT/r2r.py")"
+          cat > "$KIT/r2r.py" <<'__LEMON_EOF__'
+          #!/usr/bin/env python3
+          """LemonMod: ReadyToRun (AOT pre-compilation) of the managed code shipped in melon_data.zip.
+
+          The stock zip ships the .NET 8 runtime and all MelonLoader assemblies as plain IL, so on a phone every
+          method is JIT-compiled at startup (slow boot, slow IL2CPP interop generation, slow Harmony patching).
+          crossgen2 produces ReadyToRun images that keep the full IL (so a runtime that rejects the native code simply
+          falls back to the JIT) but start with precompiled ARM64 code.
+
+          usage: r2r.py <extracted melon_data dir> <crossgen2 path> <mode: all|no-corelib|melon-only|off> <LogPatcher.dll>
+          """
+          import os, sys, glob, shutil, struct, subprocess, tempfile, concurrent.futures as cf
+
+          md, crossgen, mode, logpatcher = sys.argv[1:5]
+          if mode == "off":
+              print("R2R disabled (mode=off)")
+              sys.exit(0)
+
+          fw_dirs = glob.glob(os.path.join(md, "dotnet", "shared", "Microsoft.NETCore.App", "*"))
+          if len(fw_dirs) != 1:
+              sys.exit(f"expected exactly one shared framework dir, found {fw_dirs}")
+          FW = fw_dirs[0]
+          NET8 = os.path.join(md, "MelonLoader", "net8")
+
+
+          def is_managed(path):
+              try:
+                  with open(path, "rb") as f:
+                      d = f.read(8192)
+                  if d[:2] != b"MZ":
+                      return False
+                  pe = struct.unpack_from("<I", d, 0x3C)[0]
+                  if d[pe:pe + 4] != b"PE\0\0":
+                      return False
+                  opt = pe + 24
+                  magic = struct.unpack_from("<H", d, opt)[0]
+                  dirs = opt + (96 if magic == 0x10B else 112)
+                  clr_rva = struct.unpack_from("<I", d, dirs + 14 * 8)[0]
+                  return clr_rva != 0
+              except Exception:
+                  return False
+
+
+          def refs_for(target):
+              """Reference assemblies, de-duplicated by simple name: own dir > MelonLoader/net8 > framework."""
+              seen, out = set(), []
+              for d in (os.path.dirname(target), NET8, FW):
+                  for p in sorted(glob.glob(os.path.join(d, "*.dll"))):
+                      n = os.path.basename(p).lower()
+                      if n in seen or p == target or not is_managed(p):
+                          continue
+                      seen.add(n)
+                      out.append(p)
+              return out
+
+
+          targets = []
+          if mode in ("all", "no-corelib"):
+              for p in sorted(glob.glob(os.path.join(FW, "*.dll"))):
+                  if mode == "no-corelib" and os.path.basename(p) == "System.Private.CoreLib.dll":
+                      continue
+                  targets.append(p)
+          for root, _, files in os.walk(os.path.join(md, "MelonLoader")):
+              rel = os.path.relpath(root, os.path.join(md, "MelonLoader"))
+              if rel.startswith("net35") or "runtimes" in rel.split(os.sep):
+                  continue  # net35 runs inside Unity's own runtime; runtimes/* are native or Windows-only
+              for f in sorted(files):
+                  if f.lower().endswith(".dll"):
+                      targets.append(os.path.join(root, f))
+          targets = [t for t in targets if is_managed(t)]
+
+          work = tempfile.mkdtemp(prefix="r2r_")
+          outdir = os.path.join(work, "out")
+          os.makedirs(outdir)
+
+
+          def compile_one(src):
+              name = os.path.basename(src)
+              rel = os.path.relpath(src, md).replace(os.sep, "__")
+              dst = os.path.join(outdir, rel)
+              input_path, refs = src, refs_for(src)
+              if name == "System.Private.CoreLib.dll":
+                  # crossgen2 8.x throws a NullReferenceException on this runtime's embedded ILLink*.xml resources
+                  # (trimmer-only metadata, unused at runtime) -> compile a copy without them.
+                  tmp = os.path.join(work, "stripped"); os.makedirs(tmp, exist_ok=True)
+                  input_path = os.path.join(tmp, name)
+                  shutil.copy2(src, input_path)
+                  r = subprocess.run(["dotnet", logpatcher, "strip-ilink", input_path], capture_output=True, text=True)
+                  if r.returncode != 0:
+                      return src, False, "strip-ilink failed: " + (r.stderr or r.stdout)[-300:]
+                  refs = [input_path] + refs
+              cmd = [crossgen, input_path, "-o", dst, "--targetos:linux", "--targetarch:arm64", "-O"]
+              for r_ in refs:
+                  cmd += ["-r", r_]
+              p = subprocess.run(cmd, capture_output=True, text=True)
+              if p.returncode != 0 or not os.path.exists(dst):
+                  return src, False, (p.stdout + p.stderr).strip().splitlines()[-1][:200] if (p.stdout + p.stderr).strip() else "unknown error"
+              return src, True, dst
+
+
+          print(f"R2R mode={mode}: {len(targets)} managed assemblies, framework={os.path.basename(FW)}")
+          ok, failed = [], []
+          with cf.ThreadPoolExecutor(max_workers=max(2, (os.cpu_count() or 2) // 2)) as ex:
+              for src, success, info in ex.map(compile_one, targets):
+                  (ok if success else failed).append((src, info))
+
+          before = after = 0
+          for src, dst in ok:
+              before += os.path.getsize(src)
+              after += os.path.getsize(dst)
+              shutil.copy2(dst, src)
+
+          print(f"R2R compiled: {len(ok)}   kept as IL: {len(failed)}")
+          print(f"managed size: {before/1e6:.1f} MB -> {after/1e6:.1f} MB")
+          for src, why in failed:
+              print(f"  [kept IL] {os.path.relpath(src, md)}: {why}")
+
+          core = os.path.join(FW, "System.Private.CoreLib.dll")
+          if mode == "all" and any(s == core for s, _ in failed):
+              print("::warning::System.Private.CoreLib could not be pre-compiled; the runtime core stays JIT-only. Everything else was optimized.")
+          shutil.rmtree(work, ignore_errors=True)
+          __LEMON_EOF__
+          mkdir -p "$(dirname "$KIT/LogPatcher/LogPatcher.csproj")"
+          cat > "$KIT/LogPatcher/LogPatcher.csproj" <<'__LEMON_EOF__'
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup>
+              <OutputType>Exe</OutputType>
+              <TargetFramework>net8.0</TargetFramework>
+              <Nullable>disable</Nullable>
+              <ImplicitUsings>enable</ImplicitUsings>
+              <RollForward>Major</RollForward>
+            </PropertyGroup>
+            <ItemGroup>
+              <PackageReference Include="Mono.Cecil" Version="0.11.5" />
+            </ItemGroup>
+          </Project>
+          __LEMON_EOF__
+          mkdir -p "$(dirname "$KIT/LogPatcher/Program.cs")"
+          cat > "$KIT/LogPatcher/Program.cs" <<'__LEMON_EOF__'
+          using Mono.Cecil;
+          using Mono.Cecil.Cil;
+
+          // LemonMod: makes MelonLogger's file writers use a real buffer.
+          // Before: new StreamWriter(stream, UTF8, 1) -> every log line was split in many tiny write() calls
+          //         on /sdcard (FUSE = slow), twice (Latest.log + cached log).
+          // After : bufferSize 1 -> 8192, so a line is flushed with ONE write() (AutoFlush stays on => crash-safe).
+          if (args.Length >= 2 && args[0] == "strip-ilink")
+          {
+              // crossgen2 8.x crashes (NullReferenceException in ProcessLinkerXmlBase) on this runtime's System.Private.CoreLib.
+              // The ILLink.*.xml resources are only metadata for the trimmer and unused at runtime, so we drop them from the
+              // copy that is fed to crossgen2.
+              var src = args[1];
+              var res = new DefaultAssemblyResolver();
+              res.AddSearchDirectory(Path.GetDirectoryName(Path.GetFullPath(src)));
+              var a = AssemblyDefinition.ReadAssembly(src, new ReaderParameters { AssemblyResolver = res });
+              var toRemove = a.MainModule.Resources.Where(r => r.Name.StartsWith("ILLink.") && r.Name.EndsWith(".xml")).ToList();
+              foreach (var r in toRemove) a.MainModule.Resources.Remove(r);
+              var tmp2 = src + ".stripped";
+              a.Write(tmp2);
+              a.Dispose();
+              File.Move(tmp2, src, true);
+              Console.WriteLine($"removed {toRemove.Count} ILLink resources from {Path.GetFileName(src)}");
+              return 0;
+          }
+          if (args.Length < 1) { Console.Error.WriteLine("usage: LogPatcher <MelonLoader.dll> | strip-ilink <dll>"); return 2; }
+          var path = args[0];
+
+          var resolver = new DefaultAssemblyResolver();
+          resolver.AddSearchDirectory(Path.GetDirectoryName(Path.GetFullPath(path)));
+          var asm = AssemblyDefinition.ReadAssembly(path, new ReaderParameters { AssemblyResolver = resolver, ReadWrite = false });
+
+          var logger = asm.MainModule.GetType("MelonLoader.MelonLogger");
+          var method = logger?.Methods.FirstOrDefault(m => m.Name == "CreateLogWriter");
+          if (method == null) { Console.Error.WriteLine("CreateLogWriter not found - nothing patched"); return 3; }
+
+          var il = method.Body.Instructions;
+          int patched = 0;
+          for (int i = 0; i < il.Count; i++)
+          {
+              if (il[i].OpCode == OpCodes.Newobj
+                  && il[i].Operand is MethodReference mr
+                  && mr.DeclaringType.Name == "StreamWriter"
+                  && mr.Parameters.Count == 3
+                  && il[i - 1].OpCode == OpCodes.Ldc_I4_1)
+              {
+                  il[i - 1] = Instruction.Create(OpCodes.Ldc_I4, 8192);
+                  patched++;
+              }
+          }
+          if (patched != 1) { Console.Error.WriteLine($"unexpected IL shape (patched={patched}) - file left untouched"); return 4; }
+
+          var tmp = path + ".patched";
+          asm.Write(tmp);
+          asm.Dispose();
+          File.Move(tmp, path, true);
+          Console.WriteLine("MelonLogger.CreateLogWriter patched (StreamWriter buffer 1 -> 8192)");
+          return 0;
+          __LEMON_EOF__
+
+      - name: Aplicar patches de performance (Rust)
+        run: python3 "$WORK/kit/patch_rust.py" "$WORK/src"
+
+      - name: Instalar Rust e cargo-ndk
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal -t aarch64-linux-android
+          cargo install cargo-ndk --locked
+
+      - name: Compilar libBootstrap.so
+        run: |
+          set -euo pipefail
+          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+          if [ -z "$NDK" ]; then NDK="$(ls -d "$ANDROID_HOME"/ndk/* | sort -V | tail -1)"; fi
+          export ANDROID_NDK_HOME="$NDK"
+          echo "NDK: $NDK"
+          cd "$WORK/src"
+          RUSTUP_TOOLCHAIN="$RUST_VERSION" cargo ndk -t arm64-v8a -o ./jniLibs build --release -p Bootstrap
+          ls -la jniLibs/arm64-v8a/libBootstrap.so
+
+      - name: Baixar base estavel (melon_data.zip)
+        run: |
+          set -euo pipefail
+          cd "$WORK"
+          curl -fL -o stock.zip "https://github.com/LemonLoader/MelonLoader/releases/download/$BASE_TAG/melon_data.zip"
+          mkdir md && unzip -q stock.zip -d md
+          ls md
+
+      - name: Trocar libBootstrap.so e ajustar runtimeconfig
+        run: |
+          set -euo pipefail
+          cp "$WORK/src/jniLibs/arm64-v8a/libBootstrap.so" "$WORK/md/native/libBootstrap.so"
+          python3 - <<'__PY__'
+          import json, os
+          p = os.path.join(os.environ["WORK"], "md/MelonLoader/net8/MelonLoader.runtimeconfig.json")
+          j = json.load(open(p))
+          c = j["runtimeOptions"].setdefault("configProperties", {})
+          c["System.Runtime.TieredPGO"] = False                       # sem overhead de instrumentacao
+          c["System.Runtime.TieredCompilation.QuickJitForLoops"] = True
+          c["System.GC.Concurrent"] = False                           # sem thread de GC em background
+          json.dump(j, open(p, "w"), indent=2)
+          print(json.dumps(c, indent=2))
+          __PY__
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Patch do logger em C# (MelonLogger)
+        run: |
+          set -euo pipefail
+          cd "$WORK/kit/LogPatcher"
+          dotnet build -c Release -o "$WORK/logpatcher" -v q
+          dotnet "$WORK/logpatcher/LogPatcher.dll" "$WORK/md/MelonLoader/net8/MelonLoader.dll" \
+            || echo "::warning::Patch do logger nao aplicado (formato inesperado); seguindo sem ele"
+
+      - name: Baixar crossgen2
+        run: |
+          set -euo pipefail
+          cd "$WORK"
+          curl -fL -o cg2.nupkg "https://api.nuget.org/v3-flatcontainer/microsoft.netcore.app.crossgen2.linux-x64/$CROSSGEN_VERSION/microsoft.netcore.app.crossgen2.linux-x64.$CROSSGEN_VERSION.nupkg"
+          mkdir cg2 && unzip -q cg2.nupkg 'tools/*' -d cg2
+          chmod +x cg2/tools/crossgen2
+
+      - name: Pre-compilar (ReadyToRun ARM64)
+        run: python3 "$WORK/kit/r2r.py" "$WORK/md" "$WORK/cg2/tools/crossgen2" "$R2R_MODE" "$WORK/logpatcher/LogPatcher.dll"
+
+      - name: Empacotar e conferir
+        run: |
+          set -euo pipefail
+          cd "$WORK/md"
+          zip -qr9 "$WORK/melon_data.zip" dotnet MelonLoader native
+          cd "$WORK"
+          diff <(unzip -Z1 stock.zip | sort) <(unzip -Z1 melon_data.zip | sort) && echo "Lista de arquivos identica a base"
+          ls -la stock.zip melon_data.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: melon_data
+          path: ${{ env.WORK }}/melon_data.zip
+
+  installer:
+    name: Instalador (APK)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Fixar SDK .NET 8 (o runner traz o 10, que nao compila MAUI net8)
+        run: |
+          set -euo pipefail
+          printf '{ "sdk": { "version": "8.0.100", "rollForward": "latestFeature" } }\n' > "$GITHUB_WORKSPACE/global.json"
+          dotnet --version
+          dotnet --list-sdks
+
+      - name: Clonar instalador e apontar para este repositorio
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/LemonLoader/MelonLoaderInstaller.git installer
+          sed -i "s#repos/LemonLoader/MelonLoader/releases/latest#repos/$REPO/releases/latest#" installer/App/Utils/PatchRunner.cs
+          grep -n "releases/latest" installer/App/Utils/PatchRunner.cs
+          grep -q "repos/$REPO/releases/latest" installer/App/Utils/PatchRunner.cs
+
+      - name: Workload MAUI Android
+        run: dotnet workload install maui-android
+
+      - name: Chave de assinatura (nova, so deste build)
+        run: |
+          set -euo pipefail
+          keytool -genkeypair -keystore installer/App/meloninstaller.keystore -alias melon \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass "$LEMON_KEYSTORE_PASS" -keypass "$LEMON_KEYSTORE_PASS" \
+            -dname "CN=LemonMod, O=LemonMod"
+        env:
+          LEMON_KEYSTORE_PASS: lemonmod-ci-pass
+
+      - name: Compilar APK
+        env:
+          LEMON_KEYSTORE_PASS: lemonmod-ci-pass
+        run: |
+          set -euo pipefail
+          cd installer
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/android-sdk}}"
+          mkdir -p "$SDK"
+          dotnet build App/MelonLoader.Installer.App.csproj -f net8.0-android -c Release \
+            -t:InstallAndroidDependencies -p:AndroidSdkDirectory="$SDK" -p:AcceptAndroidSDKLicenses=True
+          dotnet build App/MelonLoader.Installer.App.csproj -f net8.0-android -c Release \
+            -p:AndroidSdkDirectory="$SDK" -p:AndroidPackageFormat=apk
+          APK="$(find App/bin -name '*-Signed.apk' | head -1)"
+          echo "APK: $APK"
+          cp "$APK" "$GITHUB_WORKSPACE/LemonMod-Installer.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer-apk
+          path: LemonMod-Installer.apk
+
+  release:
+    name: Publicar release
+    needs: [core, installer]
+    if: ${{ inputs.publish_release != false }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: Criar release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ls -la out
+          gh release create "lemonmod-${{ github.run_number }}" out/melon_data.zip out/LemonMod-Installer.apk \
+            --repo "${{ github.repository }}" --latest \
+            --title "LemonMod build ${{ github.run_number }}" \
+            --notes "melon_data.zip otimizado (ReadyToRun + patches no bootstrap/logger) + instalador apontando para este repo. Instale o LemonMod-Installer.apk e rode o patch do jogo de novo."
